@@ -3,11 +3,7 @@ Mnemosyne 插件的数据迁移工具
 用于运行时自动迁移旧格式的 session_id 到 unified_msg_origin 格式
 """
 
-import asyncio
-import time
-from typing import TYPE_CHECKING, Any
-
-from pymilvus import Collection
+from typing import TYPE_CHECKING
 
 from astrbot.core.log import LogManager
 
@@ -114,8 +110,12 @@ async def migrate_session_data_if_needed(
 
         for candidate in candidates:
             try:
-                # 构建查询表达式：session_id 等于候选值
+                # 【诊断日志】记录候选值
+                logger.debug(f"[迁移] 检查候选值: {candidate}")
+
+                # 构建查询表达式：session_id 等于候选值（不转义）
                 expression = f'session_id == "{candidate}"'
+                logger.debug(f"[迁移] 查询表达式: {expression}")
 
                 # 查询记录
                 results = plugin.milvus_manager.query(
@@ -126,9 +126,14 @@ async def migrate_session_data_if_needed(
                 )
 
                 if results:
-                    # 过滤出不包含冒号的记录（旧格式）
+                    # 过滤出需要迁移的旧格式记录：
+                    # 1. session_id 不包含冒号（旧格式标志）
+                    # 2. session_id 与 unified_msg_origin 不同（确实需要更新）
                     old_records = [
-                        r for r in results if ":" not in r.get("session_id", "")
+                        r
+                        for r in results
+                        if ":" not in r.get("session_id", "")
+                        and r.get("session_id") != unified_msg_origin
                     ]
                     if old_records:
                         records_to_migrate.extend(old_records)
@@ -141,7 +146,7 @@ async def migrate_session_data_if_needed(
                 continue
 
         if not records_to_migrate:
-            logger.info(f"[迁移] 未找到需要迁移的旧数据")
+            logger.info("[迁移] 未找到需要迁移的旧数据")
             # 标记为已检查
             plugin._migrated_sessions.add(migration_key)
             return
@@ -151,11 +156,10 @@ async def migrate_session_data_if_needed(
         # 批量准备更新数据
         records_for_upsert = []
         for record in records_to_migrate:
-            # 更新 session_id 字段
+            # 更新 session_id 字段为新的 unified_msg_origin 格式
             record["session_id"] = unified_msg_origin
-            # 添加迁移标记
-            if "migrated_at" not in record:
-                record["migrated_at"] = int(time.time())
+            # 注意：不添加 migrated_at 字段，因为 schema 中可能没有定义
+            # 如果需要迁移标记，应该在 schema 中先添加该字段
             records_for_upsert.append(record)
 
         # 使用 upsert 批量更新（Milvus 2.3+）

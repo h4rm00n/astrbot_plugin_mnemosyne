@@ -16,7 +16,8 @@ logger = LogManager.GetLogger(log_name="MnemosyneSecurity")
 
 def validate_session_id(session_id: str) -> bool:
     """
-    验证 session_id 格式，防止注入攻击
+    验证 session_id 的基本有效性
+    仅检查空值和类型，支持任意 Unicode 字符（包括中文）
 
     Args:
         session_id: 要验证的会话ID
@@ -27,16 +28,16 @@ def validate_session_id(session_id: str) -> bool:
     if not session_id or not isinstance(session_id, str):
         return False
 
-    # 只允许字母数字、连字符、下划线和冒号（某些平台的session_id可能包含冒号）
-    # 长度限制：1-255字符
-    pattern = r"^[a-zA-Z0-9_:-]+$"
-
-    if not re.match(pattern, session_id):
-        logger.warning("session_id 格式验证失败: 包含非法字符")
+    # 仅检查是否为空字符串，支持任意 Unicode 字符（包括中文、emoji等）
+    if len(session_id.strip()) == 0:
+        logger.warning("session_id 格式验证失败: 空字符串")
         return False
 
-    if len(session_id) > 255:
-        logger.warning("session_id 格式验证失败: 长度超过255")
+    # 保留长度限制以防止异常长的输入
+    if len(session_id) > 500:
+        logger.warning(
+            f"session_id 格式验证失败: 长度超过500 (当前: {len(session_id)})"
+        )
         return False
 
     return True
@@ -97,18 +98,24 @@ def safe_build_milvus_expression(field: str, value: str, operator: str = "==") -
     if operator not in allowed_operators:
         raise ValueError(f"不支持的操作符: {operator}")
 
-    # 转义特殊字符，防止注入
-    # Milvus 表达式中的字符串需要转义反斜杠和双引号
-    escaped_value = value.replace("\\", "\\\\").replace('"', '\\"')
+    # 【诊断日志】记录原始值
+    logger.debug(
+        f"[safe_build_milvus_expression] 字段: {field}, 操作符: {operator}, 原始值: {value}"
+    )
 
-    # 构建表达式
+    # 构建表达式 - 不进行转义，直接使用原始值
     if operator == "==":
-        return f'{field} == "{escaped_value}"'
+        expr = f'{field} == "{value}"'
     elif operator == "in":
-        return f'{field} in ["{escaped_value}"]'
+        expr = f'{field} in ["{value}"]'
     else:
         # 对于比较操作符，直接使用（数值类型）
-        return f"{field} {operator} {escaped_value}"
+        expr = f"{field} {operator} {value}"
+
+    # 【诊断日志】记录生成的表达式
+    logger.debug(f"[safe_build_milvus_expression] 生成的表达式: {expr}")
+
+    return expr
 
 
 # ==================== 路径遍历防护 ====================

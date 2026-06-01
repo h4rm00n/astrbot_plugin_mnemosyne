@@ -18,7 +18,7 @@ from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.core.provider.provider import EmbeddingProvider
 
-from .admin_panel.server import AdminPanelServer
+from .web_api import MnemosyneWebApi, PLUGIN_NAME
 
 # --- 插件内部模块导入 ---
 from .core import (
@@ -31,7 +31,7 @@ from .core.constants import (
     DEFAULT_SUMMARY_CHECK_INTERVAL_SECONDS,
     DEFAULT_SUMMARY_TIME_THRESHOLD_SECONDS,
 )  # 导入使用的常量
-from .core.tools import is_group_chat
+from .core.tools import get_event_platform_id, is_group_chat
 from .memory_manager.context_manager import ConversationContextManager
 from .memory_manager.message_counter import MessageCounter
 from .memory_manager.vector_db.milvus_manager import MilvusManager
@@ -41,7 +41,7 @@ from .memory_manager.vector_db.milvus_manager import MilvusManager
     "Mnemosyne",
     "lxfight",
     "一个AstrBot插件，实现基于RAG技术的长期记忆功能。",
-    "2.0.6",
+    "2.1.0",
     "https://github.com/lxfight/astrbot_plugin_mnemosyne",
 )
 class Mnemosyne(Star):
@@ -62,8 +62,7 @@ class Mnemosyne(Star):
         self.context_manager: ConversationContextManager | None = None
         self.embedding_provider: EmbeddingProvider | None = None
         self.provider = None
-        self.admin_panel_server: AdminPanelServer | None = None  # 管理面板服务器
-        self.admin_panel_thread = None  # 管理面板服务器线程
+        self.web_api: MnemosyneWebApi | None = None  # Pages Web API
         self.plugin_data_dir: str | None = None  # 插件数据目录
 
         # --- 初始化状态标记 ---
@@ -71,6 +70,17 @@ class Mnemosyne(Star):
         self._initialized_components = []
         self._embedding_provider_ready = False
         self._migrated_sessions: set[str] = set()  # 用于记录已迁移的会话
+        self._warned_missing_provider_ids: set[str] = set()
+        self._post_load_tasks_started = False
+        self._ensure_milvus_connection_task: asyncio.Task | None = None
+        self._milvus_manager_ready = asyncio.Event()
+
+        configured_blacklist = self.config.get("platform_blacklist", [])
+        self.platform_blacklist: set[str] = {
+            str(item).strip() for item in configured_blacklist if str(item).strip()
+        }
+        if self.platform_blacklist:
+            logger.info(f"长期记忆已为以下平台禁用: {sorted(self.platform_blacklist)}")
 
         logger.info("开始初始化 Mnemosyne 插件...")
         # 启动后台异步初始化，但不包括 Embedding Provider 的初始化
@@ -78,6 +88,16 @@ class Mnemosyne(Star):
 
         # 延迟加载 Embedding Provider，只在需要时才加载
         self._embedding_provider_task = None
+
+    def _is_memory_disabled_for_event(self, event: AstrMessageEvent) -> bool:
+        """
+        判断当前事件是否应跳过记忆能力（平台黑名单）。
+        """
+        platform_id = get_event_platform_id(event)
+        if platform_id and platform_id in self.platform_blacklist:
+            logger.debug(f"平台 '{platform_id}' 在记忆黑名单中，跳过记忆流程。")
+            return True
+        return False
 
     def _initialize_embedding_provider(
         self, silent: bool = False
@@ -97,7 +117,29 @@ class Mnemosyne(Star):
             # 优先级 1: 从配置指定的 Provider ID 获取
             emb_id = self.config.get("embedding_provider_id")
             if emb_id:
-                provider = self.context.get_provider_by_id(emb_id)
+                # 避免在 AstrBot 尚未完成启动时调用 context.get_provider_by_id 产生多余的 WARN 日志。
+                provider = None
+                try:
+                    provider_manager = getattr(self.context, "provider_manager", None)
+                    inst_map = getattr(provider_manager, "inst_map", None)
+                    if isinstance(inst_map, dict):
+                        provider = inst_map.get(emb_id)
+                except (AttributeError, TypeError) as exc:
+                    # 仅在访问 provider_manager / inst_map 出现属性或类型问题时处理，避免掩盖真实错误。
+                    if silent:
+                        logger.debug(
+                            f"无法从 context 读取 Embedding Provider '{emb_id}'（provider_manager/inst_map 不可用）: {exc}"
+                        )
+                    else:
+                        logger.warning(
+                            f"无法从 context 读取 Embedding Provider '{emb_id}'（provider_manager/inst_map 不可用）: {exc}"
+                        )
+                    provider = None
+
+                # 兼容旧版本：如果无法访问 provider_manager，再回退到官方 API
+                if provider is None and not hasattr(self.context, "provider_manager"):
+                    provider = self.context.get_provider_by_id(emb_id)
+
                 # 安全地检查 provider 是否为 EmbeddingProvider 类型
                 if provider:
                     # 检查 provider 是否具有 EmbeddingProvider 的关键方法
@@ -113,6 +155,16 @@ class Mnemosyne(Star):
                             logger.warning(
                                 f"获取的 Provider {emb_id} 不是有效的 EmbeddingProvider 类型"
                             )
+                else:
+                    if (
+                        not silent
+                        and emb_id not in self._warned_missing_provider_ids
+                        and self._are_providers_initialized()
+                    ):
+                        logger.warning(
+                            f"未找到配置的 Embedding Provider: {emb_id}，请检查 AstrBot 提供商配置是否已加载/启用。"
+                        )
+                        self._warned_missing_provider_ids.add(emb_id)
 
             # 优先级 2: 使用框架默认的第一个 Embedding Provider
             # 使用 context 提供的方法获取所有 embedding providers
@@ -196,6 +248,87 @@ class Mnemosyne(Star):
         )
         return False
 
+    def _are_providers_initialized(self) -> bool:
+        """
+        判断 AstrBot 的 ProviderManager 是否已完成 Provider 加载。
+
+        说明：不要依赖 context.get_provider_by_id 的 WARN 日志来判断是否加载完成。
+        """
+        provider_manager = getattr(self.context, "provider_manager", None)
+        inst_map = getattr(provider_manager, "inst_map", None)
+        if isinstance(inst_map, dict) and len(inst_map) > 0:
+            return True
+
+        # 兜底：部分版本可能不暴露 inst_map（或初始化时机不同）
+        try:
+            if self.context.get_all_providers():
+                return True
+        except (AttributeError, TypeError) as exc:
+            logger.warning(
+                f"检查 Providers 初始化状态失败（get_all_providers 不可用）: {exc}"
+            )
+        return False
+
+    def _create_background_task(self, coro: Any, name: str) -> asyncio.Task | None:
+        """
+        安全创建后台任务：确保存在运行中的事件循环，避免在同步/无 loop 场景下直接抛异常。
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError as exc:
+            logger.warning(
+                f"无法启动后台任务 '{name}': 当前没有运行中的事件循环: {exc}"
+            )
+            return None
+
+        # 额外提示：如果不是在 Task 上下文中创建，未来改动更容易定位。
+        try:
+            if asyncio.current_task() is None:
+                logger.debug(f"启动后台任务 '{name}'：当前不在 asyncio.Task 上下文中")
+        except RuntimeError:
+            # 极少数情况下 current_task() 也可能因 loop 上下文问题抛错，忽略即可。
+            pass
+
+        try:
+            return loop.create_task(coro, name=name)  # type: ignore[arg-type]
+        except TypeError:
+            # 兼容：部分运行环境可能不支持 name 参数
+            return loop.create_task(coro)  # type: ignore[arg-type]
+
+    def _start_post_load_tasks(self):
+        """在 AstrBot 启动完成/Providers 可用后启动需要依赖 Providers 的后台任务。"""
+        if (
+            self._post_load_tasks_started
+            and self._embedding_provider_task
+            and not self._embedding_provider_task.done()
+            and self._ensure_milvus_connection_task
+            and not self._ensure_milvus_connection_task.done()
+        ):
+            return
+
+        self._post_load_tasks_started = True
+
+        # 启动 Embedding Provider 后台加载任务（静默模式）
+        if not self._embedding_provider_task or self._embedding_provider_task.done():
+            task = self._create_background_task(
+                self._initialize_embedding_provider_async(max_wait=10.0),
+                name="mnemosyne.embedding_provider_init",
+            )
+            if task:
+                self._embedding_provider_task = task
+
+        # 启动 Milvus 连接后台任务（在 Embedding Provider 加载后执行）
+        if (
+            not self._ensure_milvus_connection_task
+            or self._ensure_milvus_connection_task.done()
+        ):
+            task = self._create_background_task(
+                self._ensure_milvus_connection_async(),
+                name="mnemosyne.ensure_milvus_connection",
+            )
+            if task:
+                self._ensure_milvus_connection_task = task
+
     async def _ensure_milvus_connection_async(self):
         """
         在 Embedding Provider 加载完成后，确保 Milvus 连接已建立
@@ -207,10 +340,17 @@ class Mnemosyne(Star):
                 logger.debug("等待 Embedding Provider 加载完成后再连接 Milvus...")
                 await self._embedding_provider_task
 
-            # 检查 Milvus Manager 是否已初始化
+            # 等待 Milvus Manager 初始化完成（插件初始化可能仍在进行）
             if not self.milvus_manager:
-                logger.warning("Milvus Manager 未初始化，跳过自动连接")
-                return
+                try:
+                    await asyncio.wait_for(self._milvus_manager_ready.wait(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    logger.warning("Milvus Manager 未初始化，跳过自动连接")
+                    return
+
+                if not self.milvus_manager:
+                    logger.warning("Milvus Manager 未初始化，跳过自动连接")
+                    return
 
             # 检查是否已连接
             if self.milvus_manager.is_connected():
@@ -260,14 +400,11 @@ class Mnemosyne(Star):
             # 1. Embedding Provider 采用延迟初始化策略
             # 在后台静默尝试加载，但不阻塞插件启动
             logger.info("Embedding Provider 采用延迟初始化策略")
-
-            # 启动 Embedding Provider 后台加载任务（静默模式）
-            self._embedding_provider_task = asyncio.create_task(
-                self._initialize_embedding_provider_async(max_wait=10.0)
-            )
-
-            # 启动 Milvus 连接后台任务（在 Embedding Provider 加载后执行）
-            asyncio.create_task(self._ensure_milvus_connection_async())
+            if self._are_providers_initialized():
+                # 兼容：插件被热重载/晚加载时，Providers 可能已经就绪
+                self._start_post_load_tasks()
+            else:
+                logger.info("等待 AstrBot 启动完成后再加载 Embedding Provider")
 
             # 2. 继续初始化其他组件
             try:
@@ -316,11 +453,14 @@ class Mnemosyne(Star):
                 plugin_data_dir_str = str(plugin_data_dir) if plugin_data_dir else None
                 initialization.initialize_milvus(self, plugin_data_dir_str)
                 self._initialized_components.append("milvus")
+                if self.milvus_manager is not None:
+                    self._milvus_manager_ready.set()    # 标记 Milvus Manager 已就绪
             except Exception as e:
                 logger.warning(
                     f"Milvus 初始化失败，插件将以降级模式运行，搜索功能不可用: {e}"
                 )
                 self.milvus_manager = None
+                self._milvus_manager_ready.clear()
 
             # 3. 启动后台总结检查任务
             if self.context_manager and self.summary_time_threshold != -1:
@@ -334,64 +474,14 @@ class Mnemosyne(Star):
             else:
                 logger.warning("Context manager 未初始化，无法启动后台总结检查任务。")
 
-            # 4. 启动 Admin Panel 服务器
-            try:
-                admin_panel_config = self.config.get("admin_panel", {})
-                port = admin_panel_config.get(
-                    "port", 8000
-                )  # 从配置中获取端口，默认8000
-                host = admin_panel_config.get(
-                    "host", "127.0.0.1"
-                )  # 从配置中获取监听地址，默认127.0.0.1
-
-                # 检查并生成 Admin Panel API 密钥
-                api_key = admin_panel_config.get("api_key", "").strip()
-                if not api_key:
-                    # 生成临时强随机密码（每次重启都会重新生成）
-                    import secrets
-                    import string
-
-                    # 生成包含大小写字母、数字和特殊字符的48字符强密码
-                    alphabet = (
-                        string.ascii_letters
-                        + string.digits
-                        + "!@#$%^&*()-_=+[]{}|;:,.<>?"
-                    )
-                    api_key = "".join(secrets.choice(alphabet) for _ in range(48))
-
-                    # 注意：不保存到配置文件中，这样每次重启都会生成新密钥
-                    logger.warning("Admin Panel API 密钥未配置，已自动生成临时强密码。")
-                    logger.critical(
-                        f"临时 Admin Panel API 密钥（请妥善保管）: {api_key}"
-                    )
-                    logger.info(
-                        "此密钥仅在本次运行中有效，重启后将生成新密钥，旧密钥将失效。\n"
-                        "   如需固定密钥，请在配置文件中手动设置 admin_panel.api_key\n"
-                        "   重要提示：每次重启后必须使用新的密钥重新认证"
-                    )
-                else:
-                    logger.info("Admin Panel API 密钥已配置（固定密钥）")
-
-                # 将 plugin_data_dir 转换为字符串（如果是 Path 对象）
-                plugin_data_dir_str = str(plugin_data_dir) if plugin_data_dir else None
-                self.admin_panel_server = AdminPanelServer(
-                    self,
-                    port=port,
-                    host=host,
-                    api_key=api_key,
-                    data_dir=plugin_data_dir_str,
-                )
-                # 在独立线程中启动服务器
-                import threading
-
-                if self.admin_panel_server:  # 确保服务器实例已创建
-                    self.admin_panel_thread = threading.Thread(
-                        target=self.admin_panel_server.run_in_thread, daemon=True
-                    )
-                    self.admin_panel_thread.start()
-                    logger.info(f" Admin Panel 服务器已启动在 {host}:{port}")
-            except Exception as e:
-                logger.warning(f"⚠️ 启动 Admin Panel 服务器失败: {e}")
+            # 4. 注册 AstrBot Pages Web API（官方插件 UI 接口）
+            if hasattr(self.context, "register_web_api"):
+                try:
+                    self.web_api = MnemosyneWebApi(self)
+                    self.web_api.register_routes()
+                    logger.info("Mnemosyne Pages Web API 已注册至 AstrBot 仪表盘")
+                except Exception as e:
+                    logger.warning(f"注册 Pages Web API 失败: {e}")
 
             # 5. 标记初始化成功
             self._initialization_successful = True
@@ -410,11 +500,26 @@ class Mnemosyne(Star):
             raise
 
     # --- 事件处理钩子 (调用 memory_operations.py 中的实现) ---
+    @filter.on_astrbot_loaded()
+    async def on_astrbot_loaded(self):
+        """[事件钩子] AstrBot 初始化完成后再加载依赖 Providers 的组件。"""
+        try:
+            logger.info("AstrBot 初始化完成，开始加载 Embedding Provider...")
+            self._start_post_load_tasks()
+        except Exception as e:
+            logger.error(
+                f"处理 on_astrbot_loaded 钩子时发生捕获异常: {e}", exc_info=True
+            )
+        return
+
     @filter.on_llm_request()
     async def query_memory(self, event: AstrMessageEvent, req: ProviderRequest):
         """[事件钩子] 在 LLM 请求前，查询并注入长期记忆。"""
         # 当会话第一次发生时，插件会从AstrBot中获取上下文历史，之后的会话历史由插件自动管理
         try:
+            if self._is_memory_disabled_for_event(event):
+                return
+
             # 等待 Embedding Provider 加载完成（如果正在加载）
             if (
                 self._embedding_provider_task
@@ -478,13 +583,6 @@ class Mnemosyne(Star):
                         logger.error(f"获取当前使用的 provider 失败: {e}")
                         return
                 else:
-                    # 验证 provider_id 格式
-                    import re
-
-                    if not re.match(r"^[a-zA-Z0-9_-]+$", provider_id):
-                        logger.error(f"provider_id 格式无效: {provider_id}")
-                        return
-
                     # 尝试获取指定的 provider
                     try:
                         self.provider = self.context.get_provider_by_id(provider_id)
@@ -517,6 +615,9 @@ class Mnemosyne(Star):
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
         """[事件钩子] 在 LLM 响应后"""
         try:
+            if self._is_memory_disabled_for_event(event):
+                return
+
             result = memory_operations.handle_on_llm_resp(self, event, resp)
             # 检查返回值是否是可等待对象，如果不是则直接返回
             if result and hasattr(result, "__await__"):
@@ -588,6 +689,34 @@ class Mnemosyne(Star):
         async for result in commands.delete_session_memory_cmd_impl(
             self, event, session_id, confirm
         ):
+            yield result
+        return
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @memory_group.command("delete_record")  # type: ignore
+    async def delete_record_cmd(
+        self,
+        event: AstrMessageEvent,
+        memory_id: str,
+        session_id: str | None = None,
+        confirm: str | None = None,
+    ):
+        """[管理员] 删除指定会话中的单条记忆记录
+        使用示例：/memory delete_record [memory_id] [session_id] [--confirm]
+        """
+        async for result in commands.delete_record_cmd_impl(
+            self, event, memory_id, session_id, confirm
+        ):
+            yield result
+        return
+
+    @filter.permission_type(filter.PermissionType.MEMBER)
+    @memory_group.command("remember")  # type: ignore
+    async def remember_cmd(self, event: AstrMessageEvent, content: str):
+        """手动写入一条长期记忆
+        使用示例：/memory remember [content]
+        """
+        async for result in commands.remember_memory_cmd_impl(self, event, content):
             yield result
         return
 
@@ -681,6 +810,43 @@ class Mnemosyne(Star):
         """
         logger.info("Mnemosyne 插件正在停止...")
 
+        # 标记 Milvus 不再可用；先 clear，避免新的逻辑误判为 ready
+        self._milvus_manager_ready.clear()
+
+        # 如果有协程可能正在等待 Milvus 初始化完成，优先取消相关后台任务
+        if (
+            self._ensure_milvus_connection_task
+            and not self._ensure_milvus_connection_task.done()
+        ):
+            logger.info("正在取消 Milvus 自动连接任务...")
+            self._ensure_milvus_connection_task.cancel()
+            try:
+                await asyncio.wait_for(self._ensure_milvus_connection_task, timeout=5.0)
+            except asyncio.CancelledError:
+                logger.info("Milvus 自动连接任务已成功取消。")
+            except asyncio.TimeoutError:
+                logger.warning("等待 Milvus 自动连接任务取消超时。")
+            except Exception as e:
+                logger.error(f"等待 Milvus 自动连接任务取消时发生错误: {e}", exc_info=True)
+        self._ensure_milvus_connection_task = None
+
+        # 如果 Embedding Provider 后台初始化任务仍在运行，也一并取消
+        if self._embedding_provider_task and not self._embedding_provider_task.done():
+            logger.info("正在取消 Embedding Provider 初始化任务...")
+            self._embedding_provider_task.cancel()
+            try:
+                await asyncio.wait_for(self._embedding_provider_task, timeout=5.0)
+            except asyncio.CancelledError:
+                logger.info("Embedding Provider 初始化任务已成功取消。")
+            except asyncio.TimeoutError:
+                logger.warning("等待 Embedding Provider 初始化任务取消超时。")
+            except Exception as e:
+                logger.error(
+                    f"等待 Embedding Provider 初始化任务取消时发生错误: {e}",
+                    exc_info=True,
+                )
+        self._embedding_provider_task = None
+
         # --- 停止后台总结检查任务 ---
         if self._summary_check_task and not self._summary_check_task.done():
             logger.info("正在取消后台总结检查任务...")
@@ -696,15 +862,8 @@ class Mnemosyne(Star):
                 logger.error(f"等待后台任务取消时发生错误: {e}", exc_info=True)
         self._summary_check_task = None
 
-        # --- 停止 Admin Panel 服务器 ---
-        if self.admin_panel_server:
-            try:
-                await self.admin_panel_server.stop()
-                logger.info("Admin Panel 服务器已停止。")
-            except Exception as e:
-                logger.error(f"停止 Admin Panel 服务器时出错: {e}", exc_info=True)
 
-        # S0 优化: 清理消息计数器数据库连接
+        # --- 清理消息计数器数据库连接 ---
         if self.msg_counter:
             try:
                 if hasattr(self.msg_counter, "close"):
@@ -716,23 +875,17 @@ class Mnemosyne(Star):
         # 清理 Milvus 连接
         if self.milvus_manager and self.milvus_manager.is_connected():
             try:
-                # 不再释放集合，避免下次启动时重新加载导致启动过慢
-                # Milvus Lite 不需要手动管理内存，独立部署的 Milvus 由其自己负责
-                # if (
-                #     not self.milvus_manager._is_lite
-                #     and self.milvus_manager.has_collection(self.collection_name)
-                # ):
-                #     logger.info(f"正在从内存中释放集合 '{self.collection_name}'...")
-                #     self.milvus_manager.release_collection(self.collection_name)
-
                 logger.info("正在断开与 Milvus 的连接...")
                 self.milvus_manager.disconnect()
                 logger.info("Milvus 连接已成功断开。")
-
             except Exception as e:
                 logger.error(f"停止插件时与 Milvus 交互出错: {e}", exc_info=True)
         else:
             logger.info("Milvus 管理器未初始化或已断开连接，无需断开。")
+
+        # 断开后显式置空，保持状态一致
+        self.milvus_manager = None
+        self._milvus_manager_ready.clear()
 
         logger.info("Mnemosyne 插件已完全停止，所有资源已释放。")
         return
